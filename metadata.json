@@ -1,0 +1,6 @@
+{
+  "name": "Last-Minute Life Saver",
+  "description": "An autonomous AI agent that proactively manages, prioritizes, and breaks down your high-stress tasks to save your day.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
