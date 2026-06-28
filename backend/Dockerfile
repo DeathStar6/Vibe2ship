@@ -1,20 +1,18 @@
-# Use official Node.js light runtime
-FROM node:18-alpine
+FROM node:18-slim
 
-# Create app directory
+# Create and change to the app directory.
 WORKDIR /usr/src/app
 
-# Copy package configurations
+# Copy application dependency manifests to the container image.
+# A wildcard is used to ensure both package.json AND package-lock.json are copied.
+# Copying this separately prevents re-running npm install on every code change.
 COPY package*.json ./
 
-# Install production dependencies
-RUN npm ci --only=production
+# Install production dependencies.
+RUN npm install --only=production
 
-# Copy source code files
-COPY index.js ./
+# Copy local code to the container image.
+COPY . .
 
-# Expose port (Cloud Run defaults to 8080)
-EXPOSE 8080
-
-# Run the web service on container startup
-CMD [ "npm", "start" ]
+# Run the web service on container startup.
+CMD [ "node", "index.js" ]

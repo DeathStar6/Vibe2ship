@@ -1,0 +1,14 @@
+{
+  "tasks": [
+    {
+      "id": "1",
+      "title": "Review Q1 Financials",
+      "description": "Examine overall revenue targets and budget cuts.",
+      "deadline": "today 5 PM",
+      "priority": "LOW",
+      "isCompleted": false,
+      "steps": [],
+      "reminder": null
+    }
+  ]
+}

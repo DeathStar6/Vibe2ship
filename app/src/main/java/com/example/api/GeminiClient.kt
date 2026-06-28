@@ -8,21 +8,24 @@ import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.POST
-import retrofit2.http.Query
 import java.util.concurrent.TimeUnit
 
-interface GeminiApiService {
-    @POST("v1beta/models/gemini-3.5-flash:generateContent")
-    suspend fun generateContent(
-        @Query("key") apiKey: String,
-        @Body request: GenerateContentRequest
-    ): GenerateContentResponse
+interface BackendApiService {
+    @POST("agent/analyze")
+    suspend fun analyze(
+        @Body request: AnalyzeRequest
+    ): AgentResponse
+
+    @POST("agent/chat")
+    suspend fun chat(
+        @Body request: ChatRequest
+    ): AgentResponse
 }
 
-object GeminiClient {
-    private const val BASE_URL = "https://generativelanguage.googleapis.com/"
+object BackendClient {
+    private const val BASE_URL = "https://last-minute-life-saver-649444680735.asia-south1.run.app/"
 
-    private val moshi = Moshi.Builder()
+    val moshi = Moshi.Builder()
         .addLast(KotlinJsonAdapterFactory())
         .build()
 
@@ -35,12 +38,12 @@ object GeminiClient {
         })
         .build()
 
-    val service: GeminiApiService by lazy {
+    val service: BackendApiService by lazy {
         Retrofit.Builder()
             .baseUrl(BASE_URL)
             .client(okHttpClient)
             .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
-            .create(GeminiApiService::class.java)
+            .create(BackendApiService::class.java)
     }
 }

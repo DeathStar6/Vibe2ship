@@ -54,6 +54,7 @@ fun DashboardScreen(
     val aiInsight by viewModel.aiInsight.collectAsState()
     val nextUpTask by viewModel.nextUpTask.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
+    val canRetry by viewModel.canRetry.collectAsState()
 
     var showAddTaskDialog by varOf(false)
     var chatInputText by varOf("")
@@ -152,7 +153,11 @@ fun DashboardScreen(
                             focusedContainerColor = Color.White,
                             unfocusedContainerColor = Color.White,
                             focusedBorderColor = BentoPrimary,
-                            unfocusedBorderColor = BentoBorder
+                            unfocusedBorderColor = BentoBorder,
+                            focusedTextColor = Color(0xFF1D1B20),
+                            unfocusedTextColor = Color(0xFF1D1B20),
+                            focusedPlaceholderColor = Color(0xFF49454F),
+                            unfocusedPlaceholderColor = Color(0xFF49454F)
                         ),
                         singleLine = true,
                         trailingIcon = {
@@ -233,12 +238,29 @@ fun DashboardScreen(
                                     fontSize = 12.sp
                                 )
                             }
-                            IconButton(onClick = { viewModel.clearError() }) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Clear Error",
-                                    tint = MaterialTheme.colorScheme.onErrorContainer
-                                )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (canRetry) {
+                                    TextButton(
+                                        onClick = { viewModel.retryLastAction() },
+                                        modifier = Modifier.testTag("retry_button")
+                                    ) {
+                                        Text(
+                                            text = "Retry",
+                                            color = MaterialTheme.colorScheme.error,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                                IconButton(onClick = { viewModel.clearError() }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Clear Error",
+                                        tint = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
                             }
                         }
                     }
@@ -284,6 +306,11 @@ fun DashboardScreen(
                                     .fillMaxHeight(),
                                 verticalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
+                                SuggestedActionsCard(
+                                    tasks = tasks,
+                                    onAccept = { task, actionJson -> viewModel.acceptSuggestedAction(task, actionJson) },
+                                    onReject = { task -> viewModel.rejectSuggestedAction(task) }
+                                )
                                 TasksCard(
                                     tasks = tasks,
                                     onAddTaskClick = { showAddTaskDialog = true },
@@ -312,6 +339,11 @@ fun DashboardScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .heightIn(min = 160.dp)
+                            )
+                            SuggestedActionsCard(
+                                tasks = tasks,
+                                onAccept = { task, actionJson -> viewModel.acceptSuggestedAction(task, actionJson) },
+                                onReject = { task -> viewModel.rejectSuggestedAction(task) }
                             )
                             TasksCard(
                                 tasks = tasks,
@@ -547,7 +579,7 @@ fun TasksCard(
     tasks: List<TaskEntity>,
     onAddTaskClick: () -> Unit,
     onToggleComplete: (TaskEntity) -> Unit,
-    onDeleteTask: (Int) -> Unit,
+    onDeleteTask: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -887,6 +919,82 @@ fun AutonomousInsightCard(
     }
 }
 
+@Composable
+fun SuggestedActionsCard(
+    tasks: List<TaskEntity>,
+    onAccept: (TaskEntity, String) -> Unit,
+    onReject: (TaskEntity) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val pendingTasks = tasks.filter { it.isPendingAction }
+    if (pendingTasks.isEmpty()) return
+
+    Card(
+        modifier = modifier.testTag("suggested_actions_card"),
+        shape = RoundedCornerShape(28.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        border = BorderStroke(1.dp, BentoBorder),
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = "Suggested",
+                    tint = BentoPrimary,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "AI Suggested Actions",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    color = Color(0xFF1D1B20)
+                )
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            pendingTasks.forEach { task ->
+                // Basic proposal UI
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(BentoLogBg)
+                        .padding(12.dp)
+                ) {
+                    Text(
+                        text = "Task: ${task.title}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Proposal: ${task.pendingActionJson ?: "Optimization"}",
+                        fontSize = 11.sp,
+                        color = Color(0xFF49454F)
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = { onReject(task) }) {
+                            Text("Reject", color = Color.Red, fontSize = 11.sp)
+                        }
+                        Button(
+                            onClick = { onAccept(task, task.pendingActionJson ?: "") },
+                            colors = ButtonDefaults.buttonColors(containerColor = BentoPrimary),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                            modifier = Modifier.height(30.dp)
+                        ) {
+                            Text("Accept", fontSize = 11.sp)
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AddTaskDialog(
@@ -932,7 +1040,13 @@ fun AddTaskDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("add_task_title_input"),
-                    shape = RoundedCornerShape(12.dp)
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color(0xFF1D1B20),
+                        unfocusedTextColor = Color(0xFF1D1B20),
+                        focusedLabelColor = Color(0xFF49454F),
+                        unfocusedLabelColor = Color(0xFF49454F)
+                    )
                 )
 
                 OutlinedTextField(
@@ -941,7 +1055,13 @@ fun AddTaskDialog(
                     label = { Text("Description") },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
-                    minLines = 2
+                    minLines = 2,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color(0xFF1D1B20),
+                        unfocusedTextColor = Color(0xFF1D1B20),
+                        focusedLabelColor = Color(0xFF49454F),
+                        unfocusedLabelColor = Color(0xFF49454F)
+                    )
                 )
 
                 OutlinedTextField(
@@ -951,7 +1071,13 @@ fun AddTaskDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("add_task_deadline_input"),
-                    shape = RoundedCornerShape(12.dp)
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color(0xFF1D1B20),
+                        unfocusedTextColor = Color(0xFF1D1B20),
+                        focusedLabelColor = Color(0xFF49454F),
+                        unfocusedLabelColor = Color(0xFF49454F)
+                    )
                 )
 
                 Text(

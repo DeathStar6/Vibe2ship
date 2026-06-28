@@ -7,14 +7,16 @@ import com.squareup.moshi.Types
 
 @Entity(tableName = "tasks")
 data class TaskEntity(
-    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    @PrimaryKey val id: String,
     val title: String,
     val description: String,
     val deadline: String,
     val priority: String, // "HIGH", "MEDIUM", "LOW"
     val isCompleted: Boolean = false,
     val stepsJson: String = "[]", // Serialized JSON list of sub-steps
-    val reminderMessage: String? = null
+    val reminderMessage: String? = null,
+    val isPendingAction: Boolean = false,
+    val pendingActionJson: String? = null
 ) {
     fun getStepsList(): List<String> {
         return try {

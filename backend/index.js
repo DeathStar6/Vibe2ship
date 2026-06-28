@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -12,6 +13,20 @@ app.use(express.json());
 function serverLog(action, details) {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] [AGENT_${action.toUpperCase()}] ${JSON.stringify(details)}`);
+}
+
+/**
+ * Ensures a flat, valid Action object that matches the Android Moshi expectation.
+ */
+function createSafeAction(name, args, classification, resultMessage) {
+  return {
+    tool: name,
+    reason: args.reason || resultMessage || `Agent ${name} action.`,
+    confidence: 0.85,
+    urgency: classification === "AUTO_SAFE" ? 30 : 80,
+    classification: classification,
+    arguments: args || {}
+  };
 }
 
 // Gemini Tools Specification
@@ -84,6 +99,17 @@ const tools = [
           },
           required: ["task_id"]
         }
+      },
+      {
+        name: "delete_task",
+        description: "Deletes a task from the list when it is no longer relevant or requested for removal.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            task_id: { type: "STRING", description: "The unique ID of the task to delete" }
+          },
+          required: ["task_id"]
+        }
       }
     ]
   }
@@ -91,46 +117,81 @@ const tools = [
 
 // System prompt defining autonomous persona and guidelines
 const SYSTEM_PROMPT = `
-You are "Last-Minute Life Saver" - a proactive, high-performance, autonomous AI productivity agent designed to save a user's day when they are overwhelmed.
-You analyze their task list and make smart, autonomous scheduling adjustments.
-You have access to 5 crucial tools to directly manage their tasks:
-1. 'add_task': Adds a brand new task.
-2. 'update_task_priority': Bumps priority up or down based on deadlines/importance.
-3. 'break_task_into_steps': Breaks down a broad or difficult task into a list of 2-5 bite-sized actionable sub-steps.
-4. 'send_reminder': Sends a proactive, highly customized nudge or tip for a specific urgent task.
-5. 'mark_task_complete': Marks a task as completed.
+You are an Advanced Autonomous Productivity Agent designed to analyze, optimize, and assist with a user's task list.
 
-Your instructions:
-- Actively look for things that need fixing:
-  * If a task has a short deadline but LOW/MEDIUM priority, update its priority to HIGH.
-  * If a task is very general or broad (e.g. "Review budget", "Q1 Proposal"), autonomously call 'break_task_into_steps' to create concrete actions.
-  * If a HIGH priority task is due soon, call 'send_reminder' with an action-focused, motivating reminder.
-  * If the user specifically asks you to do something (e.g., in a re-planning chat prompt), execute it by calling the appropriate tool.
-- You can make multiple tool calls in a single turn. You can chain actions.
-- Be helpful, direct, and action-oriented.
-- Always output your final answer (after all tool calls have completed) as a concise, empathetic, high-level summary of what adjustments you made and why. Keep this summary within 3 sentences.
+CORE RESPONSIBILITIES:
+1. Analyze tasks based on: Deadline proximity, Priority, Task complexity, User productivity optimization.
+2. Actions: break_task_into_steps, update_task_priority, mark_task_complete, delete_task, add_reminder.
+3. You can chain multiple actions.
+
+STRICT HUMAN-IN-THE-LOOP (HITL) CLASSIFICATION:
+- AUTO_SAFE (can be executed immediately):
+  • break_task_into_steps
+  • add_reminder
+- REQUIRES_APPROVAL (MUST NOT be executed automatically):
+  • update_task_priority
+  • mark_task_complete
+  • delete_task
+
+Rules:
+- NEVER execute REQUIRES_APPROVAL actions directly. Instead, return them as "suggested_actions".
+- EVERY action in "actions_taken" and "suggested_actions" MUST include: confidence (0.0-1.0), urgency (0-100), and classification.
+- suggested_actions MUST only contain REQUIRES_APPROVAL actions.
+- actions_taken MUST NOT contain REQUIRES_APPROVAL actions.
+- If unsure: confidence = 0.7, urgency = 50.
+
+Return ONLY valid JSON.
+The "agent_summary" field MUST BE A PLAIN TEXT STRING (max 2 sentences).
+ABSOLUTELY NO JSON, NO CURLY BRACES, AND NO QUOTES WITHIN THE agent_summary STRING.
+EXAMPLE agent_summary: "I optimized your list by breaking down the project and setting a reminder."
 `;
 
-// Helper: Safely compare IDs that can be either Number or String
+// Helper: Safely compare IDs
 const matchTaskId = (task, idToMatch) => {
   return String(task.id) === String(idToMatch);
 };
 
-// Orchestration engine using native fetch to keep dependency footprint light & stable
+// Helper: Fetch with exponential retry
+async function fetchWithRetry(url, options, maxRetries = 3) {
+  let delay = 1000; // Start with 1 second
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const response = await fetch(url, options);
+      if (response.ok) return response;
+
+      // Only retry on specific status codes
+      if (![429, 500, 502, 503, 504].includes(response.status)) {
+        return response;
+      }
+
+      console.warn(`Gemini API transient error (${response.status}). Retrying in ${delay}ms... (Attempt ${i + 1}/${maxRetries})`);
+    } catch (err) {
+      console.error(`Fetch error: ${err.message}. Retrying in ${delay}ms... (Attempt ${i + 1}/${maxRetries})`);
+    }
+
+    await new Promise(resolve => setTimeout(resolve, delay));
+    delay *= 2; // Exponential backoff
+  }
+
+  // Final attempt
+  return fetch(url, options);
+}
+
+// Orchestration engine using native fetch
 async function runAgentOrchestrator(tasksInput, userMessage) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("GEMINI_API_KEY is not defined in the server environment variables.");
   }
 
-  // Deep copy tasks input to avoid mutating parameters directly
   let updatedTasks = JSON.parse(JSON.stringify(tasksInput || []));
   const actionsTaken = [];
+  const suggestedActions = [];
 
   const formattedTasks = updatedTasks.length === 0 
     ? "No active tasks." 
     : updatedTasks.map(t => 
-        `ID: ${t.id} | Title: ${t.title} | Priority: ${t.priority} | Deadline: ${t.deadline} | Completed: ${t.isCompleted || false} | Description: ${t.description || ""} | Steps: ${(t.steps || []).join(", ")} | Reminder: ${t.reminder || ""}`
+        `ID: ${t.id} | Title: ${t.title} | Priority: ${t.priority} | Deadline: ${t.deadline} | Completed: ${t.isCompleted || false} | Description: ${t.description || ""}`
       ).join("\n");
 
   const promptText = `
@@ -139,34 +200,25 @@ Current Active Tasks:
 ${formattedTasks}
 
 User Input/Trigger:
-${userMessage || "Analyze my task list autonomously and perform any required actions (prioritize, break down, or send reminders) to optimize my day."}
+${userMessage || "Analyze my task list autonomously and perform optimization actions. For each action, determine its Urgency (1-10) and your Confidence (0.0-1.0)."}
 `;
 
-  const contents = [
-    {
-      role: "user",
-      parts: [{ text: promptText }]
-    }
-  ];
+  const contents = [{ role: "user", parts: [{ text: promptText }] }];
 
-  let continueLoop = true;
   let iteration = 0;
   const maxIterations = 5;
   let finalSummary = "";
+  let continueLoop = true;
 
   while (continueLoop && iteration < maxIterations) {
     iteration++;
-    serverLog("iteration_start", { iteration, taskCount: updatedTasks.length });
-
     const requestBody = {
       contents: contents,
-      systemInstruction: {
-        parts: [{ text: SYSTEM_PROMPT }]
-      },
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
       tools: tools
     };
 
-    const response = await fetch(
+    const response = await fetchWithRetry(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`,
       {
         method: "POST",
@@ -176,180 +228,110 @@ ${userMessage || "Analyze my task list autonomously and perform any required act
     );
 
     if (!response.ok) {
-      const errorMsg = await response.text();
-      throw new Error(`Gemini API error (Status ${response.status}): ${errorMsg}`);
+      const errorBody = await response.json().catch(() => ({}));
+      const error = new Error(`Gemini service temporarily unavailable`);
+      error.status = response.status;
+      error.source = "gemini";
+      error.retryable = [429, 500, 502, 503, 504].includes(response.status);
+      throw error;
     }
 
     const resJson = await response.json();
-    const candidate = resJson.candidates?.[0];
-    const assistantContent = candidate?.content;
+    const assistantContent = resJson.candidates?.[0]?.content;
+    if (!assistantContent) break;
 
-    if (!assistantContent) {
-      break;
-    }
-
-    // Append response to conversation context
     contents.push(assistantContent);
-
     const parts = assistantContent.parts || [];
     const functionCalls = parts.filter(p => p.functionCall);
 
     if (functionCalls.length > 0) {
       const responseParts = [];
-
       for (const call of functionCalls) {
         const { name, args } = call.functionCall;
-        serverLog("tool_call_received", { name, args });
+
+        // Classification logic
+        const classification = ["break_task_into_steps", "add_reminder", "send_reminder", "add_task"].includes(name)
+          ? "AUTO_SAFE"
+          : "REQUIRES_APPROVAL";
 
         let resultMessage = "";
 
-        try {
-          switch (name) {
-            case "add_task": {
-              const newId = updatedTasks.length > 0 ? Math.max(...updatedTasks.map(t => parseInt(t.id) || 0)) + 1 : 1;
-              const newTaskObj = {
-                id: newId,
-                title: args.title || "Unnamed Task",
-                description: args.description || "",
-                deadline: args.deadline || "today",
-                priority: args.priority || "MEDIUM",
-                isCompleted: false,
-                steps: [],
-                reminder: null
-              };
-              updatedTasks.push(newTaskObj);
-              resultMessage = `Successfully added task: ${args.title} with ID ${newId}`;
-              
-              actionsTaken.push({
-                tool: "add_task",
-                task_id: newId,
-                reason: `Added new task "${args.title}"`
-              });
-              serverLog("add_task_success", newTaskObj);
-              break;
-            }
-
-            case "update_task_priority": {
-              const taskId = args.task_id;
-              const newPriority = args.new_priority;
-              const reason = args.reason || "Urgency recalculation";
-              
-              const taskIndex = updatedTasks.findIndex(t => matchTaskId(t, taskId));
-              if (taskIndex !== -1) {
-                const oldPriority = updatedTasks[taskIndex].priority;
-                updatedTasks[taskIndex].priority = newPriority;
-                resultMessage = `Successfully updated task ${taskId} priority to ${newPriority}`;
-                
-                actionsTaken.push({
-                  tool: "update_task_priority",
-                  task_id: taskId,
-                  reason: `Re-prioritized "${updatedTasks[taskIndex].title}" from ${oldPriority} to ${newPriority}: ${reason}`
-                });
-                serverLog("update_task_priority_success", { taskId, oldPriority, newPriority, reason });
-              } else {
-                resultMessage = `Error: Task with ID ${taskId} not found.`;
-                serverLog("update_task_priority_error", { taskId, message: "Task not found" });
+        // Tool logic
+        if (classification === "AUTO_SAFE") {
+          let actionApplied = false;
+          try {
+            switch (name) {
+              case "add_task": {
+                const newId = crypto.randomUUID();
+                const newTaskObj = {
+                  id: newId,
+                  title: args.title || "Unnamed Task",
+                  description: args.description || "",
+                  deadline: args.deadline || "today",
+                  priority: args.priority || "MEDIUM",
+                  isCompleted: false,
+                  steps: [],
+                  reminder: null
+                };
+                updatedTasks.push(newTaskObj);
+                resultMessage = `Added task: ${args.title}`;
+                actionApplied = true;
+                break;
               }
-              break;
-            }
-
-            case "break_task_into_steps": {
-              const taskId = args.task_id;
-              const steps = args.steps || [];
-              
-              const taskIndex = updatedTasks.findIndex(t => matchTaskId(t, taskId));
-              if (taskIndex !== -1) {
-                updatedTasks[taskIndex].steps = steps;
-                resultMessage = `Successfully added sub-steps to task ${taskId}`;
-                
-                actionsTaken.push({
-                  tool: "break_task_into_steps",
-                  task_id: taskId,
-                  reason: `Decomposed "${updatedTasks[taskIndex].title}" into steps: ${steps.join(", ")}`
-                });
-                serverLog("break_task_into_steps_success", { taskId, steps });
-              } else {
-                resultMessage = `Error: Task with ID ${taskId} not found.`;
-                serverLog("break_task_into_steps_error", { taskId, message: "Task not found" });
+              case "break_task_into_steps": {
+                const taskIndex = updatedTasks.findIndex(t => matchTaskId(t, args.task_id));
+                if (taskIndex !== -1) {
+                  updatedTasks[taskIndex].steps = args.steps || [];
+                  resultMessage = `Broke task into steps.`;
+                  actionApplied = true;
+                }
+                break;
               }
-              break;
-            }
-
-            case "send_reminder": {
-              const taskId = args.task_id;
-              const message = args.message;
-              
-              const taskIndex = updatedTasks.findIndex(t => matchTaskId(t, taskId));
-              if (taskIndex !== -1) {
-                updatedTasks[taskIndex].reminder = message;
-                resultMessage = `Successfully applied proactive reminder for task ${taskId}`;
-                
-                actionsTaken.push({
-                  tool: "send_reminder",
-                  task_id: taskId,
-                  reason: `Scheduled notification for "${updatedTasks[taskIndex].title}": ${message}`
-                });
-                serverLog("send_reminder_success", { taskId, message });
-              } else {
-                resultMessage = `Error: Task with ID ${taskId} not found.`;
-                serverLog("send_reminder_error", { taskId, message: "Task not found" });
+              case "add_reminder":
+              case "send_reminder": {
+                const taskIndex = updatedTasks.findIndex(t => matchTaskId(t, args.task_id));
+                if (taskIndex !== -1) {
+                  updatedTasks[taskIndex].reminder = args.message;
+                  resultMessage = `Set reminder.`;
+                  actionApplied = true;
+                }
+                break;
               }
-              break;
             }
 
-            case "mark_task_complete": {
-              const taskId = args.task_id;
-              const taskIndex = updatedTasks.findIndex(t => matchTaskId(t, taskId));
-              if (taskIndex !== -1) {
-                updatedTasks[taskIndex].isCompleted = true;
-                resultMessage = `Successfully completed task ${taskId}`;
-                
-                actionsTaken.push({
-                  tool: "mark_task_complete",
-                  task_id: taskId,
-                  reason: `Completed task "${updatedTasks[taskIndex].title}"`
-                });
-                serverLog("mark_task_complete_success", { taskId });
-              } else {
-                resultMessage = `Error: Task with ID ${taskId} not found.`;
-                serverLog("mark_task_complete_error", { taskId, message: "Task not found" });
-              }
-              break;
+            if (actionApplied) {
+              actionsTaken.push(createSafeAction(name, args, classification, resultMessage));
             }
-
-            default:
-              resultMessage = `Unsupported action: ${name}`;
-              serverLog("unsupported_tool", { name });
+          } catch (err) {
+            resultMessage = `Execution error: ${err.message}`;
           }
-        } catch (err) {
-          resultMessage = `Execution error: ${err.message}`;
-          serverLog("tool_execution_exception", { name, error: err.message });
+        } else {
+          // Suggested Action (Requires Approval)
+          suggestedActions.push(createSafeAction(name, args, classification));
+          resultMessage = `Suggested ${name} for approval.`;
         }
 
-        responseParts.push({
-          functionResponse: {
-            name: name,
-            response: { result: resultMessage }
-          }
-        });
+        responseParts.push({ functionResponse: { name, response: { result: resultMessage } } });
+      }
+      contents.push({ role: "function", parts: responseParts });
+    } else {
+      let rawSummary = parts.find(p => p.text)?.text || "Analysis complete.";
+
+      // Sanitization: If Gemini ignored the prompt and returned JSON in a string, extract the summary field or strip braces
+      try {
+        const parsed = JSON.parse(rawSummary);
+        finalSummary = parsed.agent_summary || parsed.summary || rawSummary;
+      } catch (e) {
+        finalSummary = rawSummary.replace(/\{.*\}/g, "").trim();
       }
 
-      // Feed function results back to Gemini
-      contents.push({
-        role: "function",
-        parts: responseParts
-      });
-
-    } else {
-      // No tool calls returned; retrieve final natural language message
-      finalSummary = parts.find(p => p.text)?.text || "Completed all task management optimization actions.";
       continueLoop = false;
-      serverLog("final_summary", { finalSummary });
     }
   }
 
   return {
     actions_taken: actionsTaken,
+    suggested_actions: suggestedActions,
     agent_summary: finalSummary,
     updated_tasks: updatedTasks
   };
@@ -371,6 +353,13 @@ app.post('/agent/analyze', async (req, res) => {
     res.status(200).json(result);
   } catch (error) {
     console.error("Analysis route error:", error);
+    if (error.source === "gemini") {
+      return res.status(error.status || 503).json({
+        error: error.message,
+        retryable: error.retryable,
+        source: "gemini"
+      });
+    }
     res.status(500).json({ error: error.message || "Internal server error" });
   }
 });
@@ -387,6 +376,13 @@ app.post('/agent/chat', async (req, res) => {
     res.status(200).json(result);
   } catch (error) {
     console.error("Chat route error:", error);
+    if (error.source === "gemini") {
+      return res.status(error.status || 503).json({
+        error: error.message,
+        retryable: error.retryable,
+        source: "gemini"
+      });
+    }
     res.status(500).json({ error: error.message || "Internal server error" });
   }
 });
